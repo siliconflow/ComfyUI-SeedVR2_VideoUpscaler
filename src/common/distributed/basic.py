@@ -21,7 +21,6 @@ from datetime import timedelta
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
-from ...optimization.memory_manager import is_mps_available
 
 def get_global_rank() -> int:
     """
@@ -48,7 +47,7 @@ def get_device() -> torch.device:
     """
     Get current rank device.
     """
-    if is_mps_available():
+    if hasattr(torch, 'mps') and callable(getattr(torch.mps, 'is_available', None)) and torch.mps.is_available():
         return torch.device("mps")
     return torch.device("cuda", get_local_rank())
 

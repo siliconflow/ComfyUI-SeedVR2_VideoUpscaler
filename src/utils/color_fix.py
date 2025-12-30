@@ -178,7 +178,7 @@ def wavelet_decomposition(image: Tensor, levels: int = 5) -> tuple[Tensor, Tenso
     for i in range(levels):
         radius = 2 ** i
         low_freq = wavelet_blur(image, radius)
-        high_freq.add_(image).sub_(low_freq)
+        high_freq += (image - low_freq)
         image = low_freq
     
     return high_freq, low_freq
@@ -237,13 +237,13 @@ def wavelet_reconstruction(content_feat: Tensor, style_feat: Tensor, debug: Opti
             align_corners=False
         )
     
-    # Reconstruct: content details + style color (in-place on content_high_freq)
-    content_high_freq.add_(style_low_freq)
+    # Reconstruct: content details + style color
+    result = content_high_freq + style_low_freq
     
-    # Safety clamp for normalized SDR range (in-place)
+    # Safety clamp for normalized SDR range
     # This prevents numerical errors from propagating
     # Note: For HDR support, this would need to be removed
-    return content_high_freq.clamp_(-1.0, 1.0)
+    return torch.clamp(result, -1.0, 1.0)
 
 
 def lab_color_transfer(
@@ -255,15 +255,17 @@ def lab_color_transfer(
     """
     Perceptually-accurate color transfer using CIELAB color space.
     
-    Combines wavelet reconstruction (for spatial continuity) with LAB histogram
-    matching (for precise color matching). This eliminates tile artifacts while
-    providing superior color accuracy.
+    LAB provides superior perceptual uniformity compared to RGB/HSV, enabling
+    highly accurate color matching that preserves the original image's appearance.
+    This is the RECOMMENDED method for color correction.
     
     Algorithm:
-    1. Apply wavelet reconstruction to get artifact-free base
-    2. Convert both wavelet result and style to LAB color space
-    3. Apply histogram matching to LAB channels
-    4. Convert back to RGB
+    1. Convert both images to LAB color space (D65 illuminant)
+    2. Apply histogram matching to all LAB channels:
+       - L* (luminance): Weighted blend to preserve detail
+       - a* (green-red): Full histogram matching
+       - b* (blue-yellow): Full histogram matching
+    3. Convert back to RGB
     
     Args:
         content_feat: Target tensor [B, C, H, W] in [-1, 1] with upscaled details
@@ -276,10 +278,7 @@ def lab_color_transfer(
     Returns:
         Color-corrected tensor [B, C, H, W] in [-1, 1]
     """
-    # Step 1: Apply wavelet to get artifact-free base with correct spatial structure
-    content_feat = wavelet_reconstruction(content_feat, style_feat, debug=None)
-    
-    # Handle spatial dimension mismatch (should already match after wavelet)
+    # Handle spatial dimension mismatch
     if content_feat.shape != style_feat.shape:
         debug.log(
             f"LAB: Resizing style {style_feat.shape} to match content {content_feat.shape}",
@@ -292,14 +291,14 @@ def lab_color_transfer(
             align_corners=False
         )
     
-    # Store device and convert to float32
+    # Store device
     device = content_feat.device
     
     # Convert to float32 for accurate color space conversion
     content_feat, original_dtype = ensure_float32_precision(content_feat)
     style_feat, _ = ensure_float32_precision(style_feat)
     
-    # Precompute color space conversion matrices
+    # Precompute color space conversion matrices (once per batch, not per pixel)
     rgb_to_xyz_matrix = torch.tensor([
         [0.4124564, 0.3575761, 0.1804375],
         [0.2126729, 0.7151522, 0.0721750],
@@ -316,16 +315,17 @@ def lab_color_transfer(
     epsilon = 6.0 / 29.0
     kappa = (29.0 / 3.0) ** 3
     
-    # Convert from [-1, 1] to [0, 1] range (in-place)
-    content_feat.add_(1.0).mul_(0.5).clamp_(0.0, 1.0)
-    style_feat.add_(1.0).mul_(0.5).clamp_(0.0, 1.0)
+    # Convert from [-1, 1] to [0, 1] range (in-place where possible)
+    content_rgb = content_feat.add(1.0).mul_(0.5).clamp_(0.0, 1.0)
+    style_rgb = style_feat.add(1.0).mul_(0.5).clamp_(0.0, 1.0)
+    del content_feat, style_feat
     
     # Convert to LAB color space
-    content_lab = _rgb_to_lab_batch(content_feat, device, rgb_to_xyz_matrix, epsilon, kappa)
-    del content_feat
+    content_lab = _rgb_to_lab_batch(content_rgb, device, rgb_to_xyz_matrix, epsilon, kappa)
+    del content_rgb
     
-    style_lab = _rgb_to_lab_batch(style_feat, device, rgb_to_xyz_matrix, epsilon, kappa)
-    del style_feat, rgb_to_xyz_matrix
+    style_lab = _rgb_to_lab_batch(style_rgb, device, rgb_to_xyz_matrix, epsilon, kappa)
+    del style_rgb, rgb_to_xyz_matrix
     
     # Match chrominance channels (a*, b*) for accurate color transfer
     matched_a = _histogram_matching_channel(content_lab[:, 1], style_lab[:, 1], device)
@@ -381,8 +381,6 @@ def _rgb_to_lab_batch(rgb: Tensor, device: torch.device, matrix: Tensor, epsilon
     rgb_flat = rgb_linear.permute(0, 2, 3, 1).reshape(-1, 3)
     del rgb_linear
     
-    # Ensure dtype consistency for matrix multiplication
-    rgb_flat = rgb_flat.to(dtype=matrix.dtype)
     xyz_flat = torch.matmul(rgb_flat, matrix.T)
     del rgb_flat
     
@@ -454,8 +452,6 @@ def _lab_to_rgb_batch(lab: Tensor, device: torch.device, matrix_inv: Tensor, eps
     xyz_flat = xyz.permute(0, 2, 3, 1).reshape(-1, 3)
     del xyz
     
-    # Ensure dtype consistency for matrix multiplication
-    xyz_flat = xyz_flat.to(dtype=matrix_inv.dtype)
     rgb_linear_flat = torch.matmul(xyz_flat, matrix_inv.T)
     del xyz_flat
     
@@ -494,7 +490,6 @@ def _histogram_matching_channel(source: Tensor, reference: Tensor, device: torch
     # Sort both arrays
     source_sorted, source_indices = torch.sort(source_flat)
     reference_sorted, _ = torch.sort(reference_flat)
-    del reference_flat
     
     # Quantile mapping
     n_source = len(source_sorted)
@@ -508,15 +503,12 @@ def _histogram_matching_channel(source: Tensor, reference: Tensor, device: torch
         ref_indices = (source_quantiles * (n_reference - 1)).long()
         ref_indices.clamp_(0, n_reference - 1)
         matched_sorted = reference_sorted[ref_indices]
-        del source_quantiles, ref_indices, reference_sorted
+        del source_quantiles, ref_indices
     
-    del source_sorted, source_flat
-    
-    # Reconstruct using argsort (portable across CUDA/ROCm/MPS)
-    inverse_indices = torch.argsort(source_indices)
-    del source_indices
-    matched_flat = matched_sorted[inverse_indices]
-    del matched_sorted, inverse_indices
+    # Reconstruct with matched values
+    matched_flat = torch.empty_like(source_flat)
+    matched_flat.scatter_(0, source_indices, matched_sorted)
+    del source_flat, reference_flat, source_sorted, source_indices, reference_sorted, matched_sorted
     
     return matched_flat.reshape(original_shape)
 
@@ -756,15 +748,11 @@ def _histogram_match_1d(source: Tensor, reference: Tensor, device: torch.device)
         ref_indices = (source_quantiles * (n_reference - 1)).long()
         ref_indices.clamp_(0, n_reference - 1)
         matched_sorted = reference_sorted[ref_indices]
-        del source_quantiles, ref_indices, reference_sorted
+        del source_quantiles, ref_indices
     
-    del source_sorted
-    
-    # Reconstruct using argsort (portable across CUDA/ROCm/MPS)
-    inverse_indices = torch.argsort(source_indices)
-    del source_indices
-    matched = matched_sorted[inverse_indices]
-    del matched_sorted, inverse_indices
+    matched = torch.empty_like(source)
+    matched.scatter_(0, source_indices, matched_sorted)
+    del source_sorted, source_indices, reference_sorted, matched_sorted
     
     return matched
 
