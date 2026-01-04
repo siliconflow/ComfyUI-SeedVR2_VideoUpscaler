@@ -127,6 +127,11 @@ class VideoDiffusionInfer():
                 # Fallback if VAE has no parameters (shouldn't happen)
                 device = get_device()
             
+            if device.type == 'meta':
+                actual_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                self.vae = self.vae.to_empty(device=actual_device)
+                device = actual_device
+            
             dtype = getattr(torch, self.config.vae.dtype)
             scale = self.config.vae.scaling_factor
             shift = self.config.vae.get("shifting_factor", 0.0)
@@ -167,7 +172,8 @@ class VideoDiffusionInfer():
                             latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
                                                 tile_overlap=self.encode_tile_overlap).posterior.mode().squeeze(2)
                     else:
-                        with torch.autocast(device.type, sample.dtype, enabled=True):
+                        actual_device = device if device.type != 'meta' else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                        with torch.autocast(actual_device.type, sample.dtype, enabled=True):
                             if use_sample:
                                 latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size, 
                                                         tile_overlap=self.encode_tile_overlap).latent
